@@ -1,0 +1,8 @@
+* text=auto eol=lf
+/appimage-integrator text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.png binary
+*.zip binary

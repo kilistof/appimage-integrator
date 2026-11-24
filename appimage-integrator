@@ -1,0 +1,662 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# User-local integration for trusted type-2 AppImages.
+# Requires Linux, Bash and Python 3.10+ (standard library only).
+# Optional helpers: desktop-file-validate and update-desktop-database.
+set -euo pipefail
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' 'Error: Python 3.10 or newer is required; install it using your distribution package manager.' >&2
+    exit 1
+fi
+exec python3 - "$@" <<'PYTHON'
+import sys
+
+if sys.version_info < (3, 10):
+    print('Error: Python 3.10 or newer is required.', file=sys.stderr)
+    sys.exit(1)
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import tempfile
+import xml.etree.ElementTree as ET
+
+VERSION = '2.1.0'
+MAX_DESKTOP = 1024 * 1024
+MAX_ICON = 16 * 1024 * 1024
+MARKER = 'X-AppImage-Integrator'
+ESCAPES = {'s': ' ', 'n': '\n', 'r': '\r', 't': '\t', '\\': '\\'}
+METADATA = {
+    'Name', 'GenericName', 'Comment', 'Keywords', 'Categories', 'MimeType',
+    'Terminal', 'StartupNotify', 'StartupWMClass', 'PrefersNonDefaultGPU',
+    'SingleMainWindow', 'X-KDE-RunOnDiscreteGpu',
+}
+LOCALIZED = {'Name', 'GenericName', 'Comment', 'Keywords'}
+WRAPPERS = {
+    'env', 'sh', 'bash', 'dash', 'zsh', 'ksh', 'fish', 'exec', 'nohup',
+    'setsid', 'nice', 'sudo', 'pkexec', 'flatpak', 'snap', 'gtk-launch',
+    'gio', 'python', 'python2', 'python3', 'perl', 'ruby', 'node', 'nodejs',
+    'java', 'wine', 'wine64', 'busybox', 'xdg-open',
+}
+
+
+class IntegrationError(Exception):
+    pass
+
+
+class Interrupted(Exception):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def warn(message):
+    print(f'Warning: {message}', file=sys.stderr, flush=True)
+
+
+def fail(message):
+    raise IntegrationError(message)
+
+
+def clean_text(value, label):
+    value = str(value)
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        fail(f'{label} must not contain control characters.')
+    try:
+        value.encode('utf-8', errors='strict')
+    except UnicodeEncodeError as exc:
+        raise IntegrationError(f'{label} must be valid UTF-8.') from exc
+    return value
+
+
+def escape(value):
+    """Encode the general desktop-entry string layer, separately from Exec."""
+    value = (value.replace('\\', '\\\\').replace('\n', '\\n')
+             .replace('\r', '\\r').replace('\t', '\\t'))
+    if value.startswith(' ') or value.endswith(' '):
+        value = value.replace(' ', '\\s')
+    return value
+
+
+def unescape(value):
+    result, index = [], 0
+    while index < len(value):
+        char = value[index]
+        if char == '\\':
+            index += 1
+            if index == len(value) or value[index] not in ESCAPES:
+                fail('Invalid desktop-entry string escape.')
+            char = ESCAPES[value[index]]
+        result.append(char)
+        index += 1
+    return ''.join(result)
+
+
+def quote_exec(value):
+    """Quote one Exec argument BEFORE applying general string escaping."""
+    value = value.replace('%', '%%')
+    return '"' + ''.join('\\' + c if c in '\\"$`' else c for c in value) + '"'
+
+
+def image_command(image):
+    path = str(image)
+    if '%' in path or '=' in path:
+        # '=' is forbidden in an Exec executable path, and some launchers check
+        # existence before expanding '%%'. The image is a positional argument
+        # to FIXED shell source, never interpolated or evaluated as shell code.
+        words = ('/bin/sh', '-c', 'exec "$@"', 'appimage-integrator', path)
+        return ' '.join(quote_exec(word) for word in words)
+    return quote_exec(path)
+
+
+def exec_tokens(raw):
+    """Parse desktop Exec syntax without invoking a shell; preserve suffixes."""
+    text = unescape(raw)
+    tokens, index, file_codes = [], 0, 0
+    reserved = set("'\\><~|&;$*?#()`")
+    while index < len(text):
+        while index < len(text) and text[index] == ' ':
+            index += 1
+        if index == len(text):
+            break
+        start = index
+        quoted = text[index] == '"'
+        word = []
+        if quoted:
+            index += 1
+            while index < len(text) and text[index] != '"':
+                char = text[index]
+                if char == '\\':
+                    index += 1
+                    if index == len(text) or text[index] not in '\\"$`':
+                        fail('Unsupported escape in a quoted Exec argument.')
+                    char = text[index]
+                elif char in '$`':
+                    fail('Unescaped reserved character in a quoted Exec argument.')
+                if ord(char) < 32 or ord(char) == 127:
+                    fail('Control character in an Exec argument.')
+                word.append(char)
+                index += 1
+            if index == len(text):
+                fail('Unclosed double quote in Exec.')
+            index += 1
+            if index < len(text) and text[index] != ' ':
+                fail('Exec arguments must be quoted in their entirety.')
+        else:
+            while index < len(text) and text[index] != ' ':
+                char = text[index]
+                if char in reserved or char == '"' or ord(char) < 32 or ord(char) == 127:
+                    fail('Reserved character in an unquoted Exec argument.')
+                word.append(char)
+                index += 1
+        word = ''.join(word)
+        position = 0
+        while position < len(word):
+            if word[position] == '%':
+                position += 1
+                if position == len(word) or word[position] not in '%fFuUick':
+                    fail('Unknown or deprecated Exec field code.')
+                code = word[position]
+                if code != '%' and quoted:
+                    fail('Exec field codes inside quoted arguments are unsupported.')
+                if code in 'FUi' and word != '%' + code:
+                    fail('%F, %U and %i must be standalone Exec arguments.')
+                if code in 'fFuU':
+                    file_codes += 1
+            position += 1
+        tokens.append((word, start, index))
+    if not tokens or not tokens[0][0] or file_codes > 1:
+        fail('Empty Exec, or more than one file/URL field code.')
+    executable = tokens[0][0]
+    if '=' in executable or '%' in executable.replace('%%', ''):
+        fail('Invalid executable in Exec.')
+    return text, tokens
+
+
+def rewrite_exec(raw, image):
+    text, tokens = exec_tokens(raw)
+    command = tokens[0][0].replace('%%', '%')
+    base = Path(command).name
+    if (base in WRAPPERS or re.fullmatch(r'python[23](?:\.\d+)*', base)
+            or command.startswith('-')):
+        fail(f'Exec uses the unsupported wrapper/executable {command!r}.')
+    return escape(image_command(image) + text[tokens[0][2]:]), command
+
+
+def contained_file(path, root):
+    """Only regular files whose fully resolved targets stay inside the AppDir."""
+    try:
+        resolved = path.resolve(strict=True)
+        return resolved if resolved.is_relative_to(root) and resolved.is_file() else None
+    except (OSError, RuntimeError):
+        return None
+
+
+def read_desktop(path):
+    with path.open('rb') as stream:
+        data = stream.read(MAX_DESKTOP + 1)
+    if len(data) > MAX_DESKTOP:
+        fail('Desktop file exceeds the 1 MiB safety limit.')
+    try:
+        text = data.decode('utf-8-sig')
+    except UnicodeDecodeError as exc:
+        raise IntegrationError('Desktop file must be UTF-8.') from exc
+    groups, current = {}, None
+    for number, raw in enumerate(text.replace('\r\n', '\n').split('\n'), 1):
+        line = raw.strip(' \t')
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            section = line[1:-1]
+            clean_text(section, f'Desktop group on line {number}')
+            if not section or '[' in section or ']' in section or section in groups:
+                fail(f'Invalid or duplicate desktop group on line {number}.')
+            current = groups.setdefault(section, {})
+        else:
+            key, sep, value = line.partition('=')
+            key, value = key.strip(' \t'), value.strip(' \t')
+            if current is None or not sep or not re.fullmatch(r'[A-Za-z0-9-]+(?:\[[A-Za-z0-9_.@-]+\])?', key):
+                fail(f'Malformed desktop key on line {number}.')
+            if key in current:
+                fail(f'Duplicate desktop key {key!r} on line {number}.')
+            clean_text(value, f'Desktop value on line {number}')
+            current[key] = value
+    if 'Desktop Entry' not in groups:
+        fail('Desktop file has no [Desktop Entry] group.')
+    return groups
+
+
+def select_desktop(root, requested):
+    if requested is not None:
+        relative = Path(requested)
+        clean_text(requested, 'Selected desktop path')
+        if relative.is_absolute() or '..' in relative.parts or relative.suffix != '.desktop':
+            fail('--desktop must name a relative .desktop path inside the AppDir.')
+        selected = contained_file(root / relative, root)
+        if selected is None:
+            fail('Selected desktop file is missing, nonregular, or points outside the AppDir.')
+        return selected
+    candidates = sorted(path for path in root.glob('*.desktop') if contained_file(path, root))
+    if not candidates:
+        directory = root / 'usr/share/applications'
+        try:
+            resolved = directory.resolve(strict=True)
+        except (OSError, RuntimeError):
+            resolved = None
+        if resolved is not None and resolved.is_relative_to(root) and resolved.is_dir():
+            candidates = sorted(path for path in resolved.glob('*.desktop') if contained_file(path, root))
+    if len(candidates) > 1:
+        choices = ', '.join(repr(str(path.relative_to(root))) for path in candidates)
+        fail(f'Several desktop files found: {choices}. Select one using --desktop.')
+    return contained_file(candidates[0], root) if candidates else None
+
+
+def read_icon(path, root):
+    resolved = contained_file(path, root)
+    if resolved is None:
+        return None
+    with resolved.open('rb') as stream:
+        data = stream.read(MAX_ICON + 1)
+    if len(data) > MAX_ICON:
+        warn(f'Skipping oversized icon {path.name!r}.')
+        return None
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return data, '.png'
+    if data.lstrip().startswith(b'/* XPM */'):
+        return data, '.xpm'
+    stripped = data.lstrip(b'\xef\xbb\xbf \t\r\n')
+    if (stripped.startswith(b'<')
+            and not re.search(br'<!\s*(?:DOCTYPE|ENTITY)', data, re.IGNORECASE)):
+        try:
+            if ET.fromstring(data).tag in ('svg', '{http://www.w3.org/2000/svg}svg'):
+                return data, '.svg'
+        except ET.ParseError:
+            pass
+    return None
+
+
+def select_icon(root, raw_icon):
+    icon = unescape(raw_icon)
+    clean_text(icon, 'Icon value')
+    candidates = []
+    if icon:
+        relative = Path(icon.lstrip('/'))
+        if '..' not in relative.parts:
+            candidates.append(root / relative)
+            candidates.extend(root / (str(relative) + ext) for ext in ('.svg', '.png', '.xpm'))
+    candidates.append(root / '.DirIcon')
+    if icon and '/' not in icon:
+        names = {icon, icon + '.svg', icon + '.png', icon + '.xpm'}
+        for subdirectory in ('usr/share/icons', 'usr/share/pixmaps'):
+            directory = root / subdirectory
+            try:
+                if not directory.resolve(strict=True).is_relative_to(root):
+                    continue
+            except (OSError, RuntimeError):
+                continue
+            for parent, dirs, files in os.walk(directory, followlinks=False):
+                dirs.sort()
+                for name in sorted(files):
+                    if name in names:
+                        candidates.append(Path(parent) / name)
+    candidates.extend(sorted(path for path in root.iterdir()
+                             if path.suffix.lower() in ('.svg', '.png', '.xpm')))
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        result = read_icon(candidate, root)
+        if result is not None:
+            return result
+    return None
+
+
+def allowed_metadata(key):
+    if key in METADATA:
+        return True
+    match = re.fullmatch(r'([A-Za-z0-9-]+)\[[A-Za-z0-9_.@-]+\]', key)
+    return bool(match and match[1] in LOCALIZED)
+
+
+def make_desktop(groups, image, icon, name, simple_exec):
+    original = groups.get('Desktop Entry', {})
+    if original.get('Type', 'Application') != 'Application':
+        fail('Bundled desktop entry is not an Application.')
+    entry = {'Type': 'Application'}
+    entry.update((key, value) for key, value in original.items() if allowed_metadata(key))
+    consumed = {'Type', 'Exec', 'TryExec', 'Icon', 'Actions', 'DBusActivatable'}
+    dropped = sorted(key for key in original if key not in consumed and not allowed_metadata(key))
+    if dropped:
+        warn('Omitting bundled desktop settings: ' + ', '.join(dropped) + '.')
+    default_name = image.name[:-9] if image.name.lower().endswith('.appimage') else image.name
+    if not entry.get('Name'):
+        entry['Name'] = escape(default_name)
+    if name is not None:
+        entry = {key: value for key, value in entry.items() if not key.startswith('Name[')}
+        entry['Name'] = escape(name)
+    for key in ('Terminal', 'StartupNotify', 'PrefersNonDefaultGPU', 'SingleMainWindow', 'X-KDE-RunOnDiscreteGpu'):
+        if key in entry and entry[key] not in ('true', 'false'):
+            fail(f'Bundled {key} must be true or false.')
+    original_command = None
+    if simple_exec:
+        entry['Exec'] = escape(image_command(image))
+        entry.pop('MimeType', None)
+        warn('--simple-exec discards bundled launch arguments, desktop actions and MIME types.')
+    elif original.get('Exec'):
+        try:
+            entry['Exec'], original_command = rewrite_exec(original['Exec'], image)
+        except IntegrationError as exc:
+            raise IntegrationError(f'{exc} Use --simple-exec only if the AppImage works without its bundled arguments.') from exc
+    else:
+        entry['Exec'] = escape(image_command(image))
+        if original:
+            warn('No bundled Exec found; creating a launcher without file/URL arguments.')
+    entry['TryExec'] = escape(str(image))
+    entry['Icon'] = escape(icon)
+    entry.setdefault('Terminal', 'false')
+    entry['DBusActivatable'] = 'false'
+    entry[MARKER] = 'true'
+    entry['X-AppImage-Integrator-Version'] = VERSION
+    entry['X-AppImage-Integrator-Source'] = escape(str(image))
+    actions = []
+    action_groups = []
+    if not simple_exec:
+        for action in filter(None, original.get('Actions', '').split(';')):
+            if action in actions:
+                continue
+            group = groups.get('Desktop Action ' + action, {})
+            try:
+                if not re.fullmatch(r'[A-Za-z0-9_-]+', action) or not group.get('Name'):
+                    fail('missing name or unsupported action identifier')
+                command, original_action = rewrite_exec(group.get('Exec', ''), image)
+                if original_command is None or original_action != original_command:
+                    fail('action invokes a different executable')
+                values = {key: value for key, value in group.items()
+                          if key == 'Name' or key.startswith('Name[')}
+                values['Exec'] = command
+                values['Icon'] = escape(icon)
+                actions.append(action)
+                action_groups.append(('Desktop Action ' + action, values))
+            except IntegrationError as exc:
+                warn(f'Omitting desktop action {action!r}: {exc}')
+    if actions:
+        entry['Actions'] = ';'.join(actions) + ';'
+    retained_groups = {'Desktop Entry'} | {section for section, _ in action_groups}
+    unsupported_groups = sorted(section for section in groups
+                                if section not in retained_groups and not section.startswith('Desktop Action '))
+    if unsupported_groups:
+        warn('Omitting unsupported desktop groups: ' + ', '.join(repr(section) for section in unsupported_groups) + '.')
+    selected = [('Desktop Entry', entry)] + action_groups
+    return ('\n\n'.join('[' + section + ']\n' + '\n'.join(key + '=' + value for key, value in values.items())
+                        for section, values in selected) + '\n').encode('utf-8')
+
+
+def confirm_trust(yes, image):
+    warn('Extraction executes the AppImage runtime with your user permissions; its format marker is not an authenticity check.')
+    if yes:
+        return True
+    try:
+        # TextIOWrapper update mode may require seekability on Python versions
+        # where a terminal is not seekable. Separate read/write streams also
+        # keep the embedded-program stdin independent of the user's response.
+        with open('/dev/tty', 'r', encoding='utf-8') as reader, \
+                open('/dev/tty', 'w', encoding='utf-8') as writer:
+            writer.write(f'Trust and integrate {str(image)!r}? [y/N] ')
+            writer.flush()
+            answer = reader.readline().strip().lower()
+    except OSError as exc:
+        raise IntegrationError('No interactive terminal. Use --yes only for an AppImage you have decided to trust.') from exc
+    if answer not in ('y', 'yes'):
+        print('Cancelled; nothing installed.')
+        return False
+    return True
+
+
+def stop_extraction(process):
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    # Reap the runtime before TemporaryDirectory removes its working tree.
+    process.wait()
+
+
+def extract(image, work, timeout):
+    environment = os.environ.copy()
+    for key in ('TARGET_APPIMAGE', 'APPIMAGE', 'APPDIR', 'ARGV0', 'APPIMAGE_EXTRACT_AND_RUN'):
+        environment.pop(key, None)
+    print(f'Extracting {str(image)!r} ...', flush=True)
+    with tempfile.TemporaryFile(dir=work) as log:
+        process = subprocess.Popen([str(image), '--appimage-extract'], cwd=work,
+                                   env=environment, stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        try:
+            status = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            stop_extraction(process)
+            raise IntegrationError(f'Extraction timed out after {timeout} seconds; use --timeout to increase the limit.') from exc
+        except BaseException:
+            stop_extraction(process)
+            raise
+        if status:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 16384))
+            detail = log.read().decode('utf-8', errors='replace')
+            fail(f'Extraction failed (exit {status}). Log tail: {detail!r}')
+    root = work / 'squashfs-root'
+    if root.is_symlink() or not root.is_dir():
+        fail('Extraction did not create a real squashfs-root directory.')
+    return root.resolve()
+
+
+def managed_desktop(path):
+    if path.is_symlink():
+        fail(f'Refusing to overwrite a symbolic-link desktop file: {path}')
+    if not path.exists():
+        return None
+    if not path.is_file():
+        fail(f'Desktop destination is not a regular file: {path}')
+    entry = read_desktop(path)['Desktop Entry']
+    if entry.get(MARKER) != 'true':
+        fail(f'Refusing to overwrite a desktop file not managed by this script: {path}')
+    return entry
+
+
+def ensure_directory(path):
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        fail(f'Unsafe destination directory: {path}')
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+def atomic_write(path, data):
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        fail(f'Refusing an unsafe output file: {path}')
+    descriptor, name = tempfile.mkstemp(prefix='.appimage-', suffix=path.suffix, dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o644)
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
+
+
+def integrate(args):
+    if os.geteuid() == 0:
+        fail('Run this script as your normal desktop user, not root or sudo.')
+    clean_text(args.image, 'AppImage path')
+    image = Path(args.image).expanduser().resolve(strict=True)
+    clean_text(image, 'Resolved AppImage path')
+    if not image.is_file():
+        fail(f'AppImage is not a regular file: {image}')
+    with image.open('rb') as stream:
+        header = stream.read(11)
+    if header[:4] != b'\x7fELF' or header[8:11] != b'AI\x02':
+        fail('Not a standard type-2 AppImage (ELF / AI02 header missing). Legacy type-1 images are not supported.')
+    if args.name is not None:
+        clean_text(args.name, 'Application name')
+        if not args.name.strip():
+            fail('--name must not be empty.')
+    if args.id is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,79}', args.id):
+        fail('--id must be 1-80 letters, digits, dots, underscores or hyphens, starting with a letter or digit.')
+    if args.timeout <= 0:
+        fail('--timeout must be positive.')
+    data_value = os.environ.get('XDG_DATA_HOME', '')
+    if data_value and not os.path.isabs(data_value):
+        warn('Ignoring relative XDG_DATA_HOME; using ~/.local/share.')
+        data_value = ''
+    data = Path(data_value) if data_value else Path.home() / '.local/share'
+    clean_text(data, 'User data directory')
+    data = data.resolve()
+    clean_text(data, 'Resolved user data directory')
+    identity = args.id or hashlib.sha256(os.fsencode(str(image))).hexdigest()[:20]
+    stem = 'appimage-' + identity
+    applications = data / 'applications'
+    destination = applications / (stem + '.desktop')
+    assets = data / 'appimage-integrator'
+    icon_dir = assets / 'icons'
+    managed_desktop(destination)
+    if not confirm_trust(args.yes, image):
+        return
+    if not os.access(image, os.X_OK):
+        image.chmod(stat.S_IMODE(image.stat().st_mode) | stat.S_IXUSR)
+    if not os.access(image, os.X_OK):
+        fail('AppImage is not executable for this user; check ownership and mount options.')
+    with tempfile.TemporaryDirectory(prefix='appimage-integrator-') as directory:
+        work = Path(directory).resolve()
+        root = extract(image, work, args.timeout)
+        desktop = select_desktop(root, args.desktop)
+        groups = read_desktop(desktop) if desktop is not None else {}
+        if desktop is not None:
+            print(f'Using desktop metadata: {str(desktop.relative_to(root))!r}', flush=True)
+        else:
+            print('No desktop file found; creating a basic launcher.', flush=True)
+        chosen_icon = select_icon(root, groups.get('Desktop Entry', {}).get('Icon', ''))
+        icon_path = None
+        if chosen_icon is not None:
+            icon_data, extension = chosen_icon
+            digest = hashlib.sha256(icon_data).hexdigest()[:20]
+            icon_path = icon_dir / (stem + '-' + digest + extension)
+        else:
+            warn('No usable bundled PNG/SVG/XPM icon found; using a generic theme icon.')
+        content = make_desktop(groups, image, str(icon_path) if icon_path else 'application-x-executable',
+                               args.name, args.simple_exec)
+        staged = work / (stem + '.desktop')
+        staged.write_bytes(content)
+        validator = shutil.which('desktop-file-validate')
+        if validator:
+            result = subprocess.run([validator, str(staged)], capture_output=True, timeout=30)
+            detail = (result.stdout + result.stderr).decode('utf-8', errors='replace')
+            if result.returncode:
+                fail(f'Desktop validation failed; existing launcher unchanged. Details: {detail!r}')
+            if detail:
+                warn(f'Desktop validator output: {detail!r}')
+        else:
+            warn('desktop-file-validate is unavailable; external desktop validation was skipped.')
+        ensure_directory(applications)
+        ensure_directory(assets)
+        ensure_directory(icon_dir)
+        lock_path = assets / '.lock'
+        # RDWR avoids blocking on an existing FIFO before fstat can reject it.
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(lock_fd, 'a') as lock:
+            lock_stat = os.fstat(lock.fileno())
+            if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.geteuid():
+                fail('Refusing a lock that is not a regular file owned by the current user.')
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            previous = managed_desktop(destination)
+            old_icon = Path(unescape(previous.get('Icon', ''))) if previous else None
+            existed = icon_path.exists() if icon_path else False
+            icon_written = False
+            try:
+                if icon_path:
+                    if icon_path.is_symlink() or (existed and not icon_path.is_file()):
+                        fail(f'Refusing an unsafe icon destination: {icon_path}')
+                    if existed:
+                        with icon_path.open('rb') as stream:
+                            if stream.read(MAX_ICON + 1) != icon_data:
+                                fail(f'Existing icon differs from its expected content: {icon_path}')
+                    else:
+                        atomic_write(icon_path, icon_data)
+                        icon_written = True
+                atomic_write(destination, content)
+            except (OSError, IntegrationError):
+                if icon_written and not existed:
+                    with contextlib.suppress(OSError):
+                        icon_path.unlink(missing_ok=True)
+                raise
+            # On interruption leave assets in place: the launcher could already
+            # have committed, and an orphan icon is preferable to a broken one.
+            if (old_icon and old_icon != icon_path and old_icon.parent == icon_dir
+                    and re.fullmatch(re.escape(stem) + r'-[0-9a-f]{20}\.(?:png|svg|xpm)', old_icon.name)
+                    and not old_icon.is_symlink()):
+                try:
+                    old_icon.unlink(missing_ok=True)
+                except OSError as exc:
+                    warn(f'Installed successfully, but could not remove the previous icon: {exc}')
+    print(f'Installed: {destination}\nSource:    {image}\nIcon:      {icon_path or "application-x-executable"}', flush=True)
+    updater = shutil.which('update-desktop-database')
+    if updater:
+        try:
+            result = subprocess.run([updater, str(applications)], capture_output=True, timeout=30)
+            if result.returncode:
+                detail = result.stderr.decode('utf-8', errors='replace')
+                warn(f'Launcher installed, but the desktop database refresh failed: {detail!r}')
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            warn(f'Launcher installed, but the desktop database refresh failed: {exc}')
+    else:
+        warn('update-desktop-database is unavailable; the desktop cache was not refreshed.')
+    print('Keep the AppImage at this path; it has not been copied or moved.')
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='appimage-integrator',
+        description='Integrate one trusted type-2 AppImage for the current desktop user.',
+        epilog='Extraction executes the AppImage runtime. Run as your normal user, never with sudo.')
+    parser.add_argument('--version', action='version', version=VERSION)
+    parser.add_argument('--yes', '-y', action='store_true', help='acknowledge trust without an interactive prompt')
+    parser.add_argument('--id', metavar='ID', help='stable launcher ID; reuse it for updates (default: hash of resolved absolute path)')
+    parser.add_argument('--name', help='override the displayed application name and its translations')
+    parser.add_argument('--desktop', metavar='RELATIVE_PATH', help='select an embedded .desktop file when several exist')
+    parser.add_argument('--simple-exec', action='store_true', help='explicitly discard bundled arguments, actions and MIME types')
+    parser.add_argument('--timeout', type=int, default=300, metavar='SECONDS',
+                        help='extraction time limit (default: 300)')
+    parser.add_argument('image', metavar='APPIMAGE', help='path to the AppImage; input symlinks resolve to their target')
+    args = parser.parse_args()
+    os.umask(0o077)
+    integrate(args)
+
+
+def interrupted(signum, _frame):
+    raise Interrupted(signum)
+
+
+for termination_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(termination_signal, interrupted)
+
+try:
+    main()
+except Interrupted as exc:
+    print('\nInterrupted; temporary extraction files cleaned up.', file=sys.stderr)
+    sys.exit(128 + exc.signum)
+except KeyboardInterrupt:
+    print('\nInterrupted; temporary extraction files cleaned up.', file=sys.stderr)
+    sys.exit(130)
+except (IntegrationError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+    print(f'Error: {exc}', file=sys.stderr)
+    sys.exit(1)
+PYTHON

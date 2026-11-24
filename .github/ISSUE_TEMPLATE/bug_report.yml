@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a problem integrating a trusted AppImage.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a security issue, follow SECURITY.md instead of posting exploit details here.
+        Remove private paths, access tokens, and other personal data from commands and logs.
+
+  - type: input
+    id: version
+    attributes:
+      label: Integrator version
+      description: Output of appimage-integrator --version.
+      placeholder: "2.1.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Distribution and version, CPU architecture, desktop environment, and Python version.
+      placeholder: |
+        Distribution:
+        Architecture:
+        Desktop/session:
+        python3 --version:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the integration command and the public AppImage source/version, if available. Do not attach the AppImage binary.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and error output
+      description: Describe the result and include relevant sanitized output. Say whether the AppImage runs directly without this integrator.
+      render: text
+    validations:
+      required: true
